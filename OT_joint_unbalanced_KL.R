@@ -1,0 +1,102 @@
+OT_KL_unbalanced_joint <- function(datab, index_DB_Y_Z = 1:3,
+                                   nominal = NULL, ordinal = NULL, logic = NULL,
+                                   convert.num = NULL, convert.class = NULL,
+                                   dist.choice = "E", percent.knn = 1,
+                                   tau = 1.0, epsilon = 0.05,
+                                   which.DB = "BOTH") {
+
+  # --- INTERNAL SINKHORN ENGINE ---
+  sinkhorn_unbalanced <- function(C, a, b, tau, eps, iter = 50) {
+    K <- exp(-C / eps)
+    u <- rep(1, length(a)); v <- rep(1, length(b))
+    fi <- tau / (tau + eps)
+    for (i in 1:iter) {
+      u <- (a / (K %*% v + 1e-15))^fi
+      v <- (b / (t(K) %*% u + 1e-15))^fi
+    }
+    return(diag(as.vector(u)) %*% K %*% diag(as.vector(v)))
+  }
+
+  tstart <- Sys.time()
+
+  # 1. Pre-processing
+  dataB <- transfo_dist(datab, index_DB_Y_Z = index_DB_Y_Z, quanti = convert.num,
+                        nominal = nominal, ordinal = ordinal, logic = logic,
+                        convert_num = convert.num, convert_class = convert.class,
+                        prep_choice = dist.choice)
+
+  inst <- proxim_dist(dataB, norm = dist.choice, prox = 0)
+
+  # 2. Dimensions and profiles
+  nA <- inst$nA; nB <- inst$nB; Y <- inst$Y; Z <- inst$Z
+  indXA <- inst$indXA; indXB <- inst$indXB; nbX <- length(indXA)
+  Xobserv <- inst$Xobserv; Zobserv <- inst$Zobserv; Yobserv <- inst$Yobserv
+  ID_prof <- paste0("P_", 1:nrow(unique(Xobserv)))
+
+  # 3. Cost Matrix
+  C_mat <- avg_dist_closest(inst, percent_closest = percent.knn)[[1]]
+
+  # 4. Initialization
+  estimatorZA <- array(1/length(Z), dim = c(nbX, length(Y), length(Z)))
+  estimatorYB <- array(1/length(Y), dim = c(nbX, length(Z), length(Y)))
+  gammaA_list <- list(); gammaB_list <- list()
+
+  # 5. Core Transport Loop
+  for (x in 1:nbX) {
+    mu_x <- sapply(Y, function(y) length(indXA[[x]][Yobserv[indXA[[x]]] == y])/nA) + 1e-10
+    nu_x <- sapply(Z, function(z) length(indXB[[x]][Zobserv[indXB[[x]] + nA] == z])/nB) + 1e-10
+
+    gamma_x <- sinkhorn_unbalanced(C_mat, mu_x, nu_x, tau, epsilon)
+
+    # Fill Estimator ZA (Predict Z in A)
+    if (which.DB %in% c("A", "BOTH")) {
+      for(y in 1:length(Y)) {
+        row_s <- sum(gamma_x[y, ])
+        if(row_s > 1e-12) estimatorZA[x, y, ] <- gamma_x[y, ] / row_s
+      }
+      gammaA_list[[x]] <- gamma_x
+    }
+
+    # Fill Estimator YB (Predict Y in B)
+    if (which.DB %in% c("B", "BOTH")) {
+      for(z in 1:length(Z)) {
+        col_s <- sum(gamma_x[, z])
+        if(col_s > 1e-12) estimatorYB[x, z, ] <- gamma_x[, z] / col_s
+      }
+      gammaB_list[[x]] <- gamma_x
+    }
+  }
+
+  # 6. Database A Completion (DATA1_OT)
+  DATA1_OT <- dataB[dataB[, 1] == unique(dataB[, 1])[1], ]
+  if (which.DB %in% c("A", "BOTH")) {
+    probZA <- matrix(0, nA, length(Z))
+    for(x in 1:nbX) for(i in indXA[[x]]) probZA[i, ] <- estimatorZA[x, Yobserv[i], ]
+    DATA1_OT$OTpred <- factor(levels(dataB[, 3])[apply(probZA, 1, which.max)], levels = levels(dataB[, 3]))
+  }
+
+  # 7. Database B Completion (DATA2_OT)
+  DATA2_OT <- dataB[dataB[, 1] == unique(dataB[, 1])[2], ]
+  if (which.DB %in% c("B", "BOTH")) {
+    probYB <- matrix(0, nB, length(Y))
+    for(x in 1:nbX) for(i in indXB[[x]]) probYB[i, ] <- estimatorYB[x, Zobserv[i + nA], ]
+    DATA2_OT$OTpred <- factor(levels(dataB[, 2])[apply(probYB, 1, which.max)], levels = levels(dataB[, 2]))
+  }
+
+  tend <- Sys.time()
+
+  # Final Object (The 'otres' structure)
+  res <- list(
+    time_exe = difftime(tend, tstart),
+    gamma_A = if(length(gammaA_list) > 0) Reduce("+", gammaA_list) else NULL,
+    gamma_B = if(length(gammaB_list) > 0) Reduce("+", gammaB_list) else NULL,
+    profile = data.frame(ID = ID_prof, unique(Xobserv)),
+    res_prox = inst,
+    estimatorZA = if(which.DB %in% c("A", "BOTH")) estimatorZA else NULL,
+    estimatorYB = if(which.DB %in% c("B", "BOTH")) estimatorYB else NULL,
+    DATA1_OT = DATA1_OT,
+    DATA2_OT = DATA2_OT
+  )
+  class(res) <- "otres"
+  return(res)
+}
