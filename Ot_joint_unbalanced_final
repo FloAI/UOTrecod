@@ -1,0 +1,117 @@
+OT_Metric_Robust_KL_joint_Final <- function(datab, index_DB_Y_Z = 1:3,
+                                            nominal = NULL, ordinal = NULL, logic = NULL,
+                                            convert.num = NULL, convert.class = NULL,
+                                            alpha_robust = 1.0, # Controls trust in empirical data
+                                            lambda_smooth = 0.1, # Controls smoothness across neighbors
+                                            epsilon = 0.05,
+                                            k_huber = 1.345,
+                                            max_iter = 150,
+                                            tol = 1e-8) {
+  
+  tstart <- Sys.time()
+  
+  # --- 1. PRE-PROCESSING (Euclidean Standardization) ---
+  # Ensures all covariates contribute equally, preventing scale dominance
+  dataB <- transfo_dist(datab, index_DB_Y_Z = index_DB_Y_Z, quanti = convert.num,
+                        nominal = nominal, ordinal = ordinal, logic = logic,
+                        convert_num = convert.num, convert_class = convert.class,
+                        prep_choice = "E")
+  
+  inst <- proxim_dist(dataB, norm = "E", prox = 0)
+  nA <- inst$nA; nB <- inst$nB; Y <- inst$Y; Z <- inst$Z
+  indXA <- inst$indXA; indXB <- inst$indXB; nbX <- length(indXA)
+  Xobserv <- inst$Xobserv; Yobserv <- inst$Yobserv; Zobserv <- inst$Zobserv
+
+  # --- 2. GRAPH CONSTRUCTION (Regularization) ---
+  # Builds adjacency matrix to enforce smooth transport maps (R-JOINT)
+  dist_X <- as.matrix(proxy::dist(Xobserv, method = "euclidean"))
+  W <- exp(-dist_X^2 / (2 * median(dist_X)^2))
+  diag(W) <- 0
+  
+  # --- 3. ROBUST COST MATRIX ---
+  # Uses Centroids + Huber Loss to dampen the effect of outliers
+  centroids_Y <- aggregate(as.data.frame(dataB[1:nA, -index_DB_Y_Z]), 
+                           list(dataB[1:nA, index_DB_Y_Z[2]]), mean)[,-1]
+  centroids_Z <- aggregate(as.data.frame(dataB[(nA+1):(nA+nB), -index_DB_Y_Z]), 
+                           list(dataB[(nA+1):(nA+nB), index_DB_Y_Z[3]]), mean)[,-1]
+  
+  C_raw <- as.matrix(proxy::dist(centroids_Y, centroids_Z, method = "euclidean"))
+  C_mat <- ifelse(abs(C_raw) <= k_huber, 0.5 * (C_raw^2), k_huber * abs(C_raw) - 0.5 * k_huber^2)
+  C_mat <- C_mat / max(C_mat)
+
+  # --- 4. SCALED UNBALANCED PARAMETERS (Consistency) ---
+  # Scales penalty with sqrt(n) to match paper's error bound theory
+  tau_A <- alpha_robust * sqrt(nA)
+  tau_B <- alpha_robust * sqrt(nB)
+  
+  phi_A <- tau_A / (tau_A + epsilon)
+  phi_B <- tau_B / (tau_B + epsilon)
+  K <- exp(-C_mat / epsilon)
+
+  # --- 5. CORE TRANSPORT LOOP ---
+  estimatorZA <- array(1/length(Z), dim = c(nbX, length(Y), length(Z)))
+  estimatorYB <- array(1/length(Y), dim = c(nbX, length(Z), length(Y)))
+  gamma_list <- list()
+
+  for (x in 1:nbX) {
+    # Empirical Marginals
+    mu_x <- sapply(Y, function(y) length(indXA[[x]][Yobserv[indXA[[x]]] == y])/nA) + 1e-12
+    nu_x <- sapply(Z, function(z) length(indXB[[x]][Zobserv[indXB[[x]] + nA] == z])/nB) + 1e-12
+    
+    # Unbalanced Sinkhorn (Relaxation of Marginals)
+    u <- rep(1, length(Y)); v <- rep(1, length(Z))
+    for (it in 1:max_iter) {
+      u_old <- u
+      u <- (mu_x / (K %*% v + 1e-16))^phi_A
+      v <- (nu_x / (t(K) %*% u + 1e-16))^phi_B
+      if (max(abs(u - u_old)) < tol) break
+    }
+    
+    gamma_x <- diag(as.vector(u)) %*% K %*% diag(as.vector(v))
+    
+    # Graph Smoothing (Regularization of Covariates)
+    # Mixing current plan with neighbors to enforce "slow variations"
+    neighbors <- which(W[x, ] > 0.01)
+    if(length(neighbors) > 0 && length(gamma_list) >= max(neighbors)) {
+       neighbor_gammas <- Reduce("+", gamma_list[neighbors]) / length(neighbors)
+       gamma_x <- (1 - lambda_smooth) * gamma_x + (lambda_smooth * neighbor_gammas)
+    }
+    
+    gamma_list[[x]] <- gamma_x
+
+    # Conditional Probability Extraction
+    for(y in 1:length(Y)) {
+       rs <- sum(gamma_x[y, ])
+       if(rs > 1e-12) estimatorZA[x, y, ] <- gamma_x[y, ] / rs
+    }
+    for(z in 1:length(Z)) {
+       cs <- sum(gamma_x[, z])
+       if(cs > 1e-12) estimatorYB[x, z, ] <- gamma_x[, z] / cs
+    }
+  }
+
+  # --- 6. INDIVIDUAL PREDICTIONS ---
+  DATA1_OT <- dataB[1:nA, ]
+  DATA2_OT <- dataB[(nA+1):(nA+nB), ]
+  
+  probZA <- matrix(0, nA, length(Z))
+  for(x in 1:nbX) for(i in indXA[[x]]) probZA[i, ] <- estimatorZA[x, Yobserv[i], ]
+  DATA1_OT$OTpred <- factor(levels(dataB[, 3])[apply(probZA, 1, which.max)], levels = levels(dataB[, 3]))
+
+  probYB <- matrix(0, nB, length(Y))
+  for(x in 1:nbX) for(i in indXB[[x]]) probYB[i, ] <- estimatorYB[x, Zobserv[i + nA], ]
+  DATA2_OT$OTpred <- factor(levels(dataB[, 2])[apply(probYB, 1, which.max)], levels = levels(dataB[, 2]))
+
+  tend <- Sys.time()
+
+  res <- list(time_exe = difftime(tend, tstart),
+              gamma = Reduce("+", gamma_list),
+              profile = data.frame(ID = paste0("P_", 1:nrow(unique(Xobserv))), unique(Xobserv)),
+              res_prox = inst,
+              estimatorZA = estimatorZA,
+              estimatorYB = estimatorYB,
+              DATA1_OT = DATA1_OT,
+              DATA2_OT = DATA2_OT)
+  class(res) <- "otres"
+  return(res)
+}
